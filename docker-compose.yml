@@ -1,0 +1,372 @@
+# =============================================================================
+#  Laboratorio Zabbix — Academia de Ciberseguridad
+#  Stack profesional con hardening por defecto. Pensado para docencia.
+#
+#  Servicios base (siempre):   postgres, zabbix-server, zabbix-web,
+#                              agent-web, agent-db, psk-init, provisioner
+#  Perfil "grafana":           grafana (dashboards avanzados)
+#  Perfil "demo":              srv-app (3er cliente con carga real -> gráficas vivas)
+#  Perfil "vuln":              agent-vuln (agente DELIBERADAMENTE inseguro,
+#                              solo para el módulo ofensivo, en red aislada)
+#
+#  Principios de diseño (se explican en docs/03-hardening.md):
+#   - Contraseñas y claves como *secrets*, nunca en variables en claro.
+#   - La BD no publica puerto ni tiene salida a Internet (red interna).
+#   - Cifrado PSK obligatorio agente<->servidor; el material PSK pertenece
+#     al usuario del servicio con permisos 0600.
+#   - no-new-privileges, drop de NET_RAW, límites de memoria/PIDs, logs acotados.
+# =============================================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - NET_RAW          # ningún contenedor necesita sockets crudos (anti ARP/scan)
+  restart: unless-stopped
+  logging: *default-logging
+
+services:
+
+  # ---------------------------------------------------------------------------
+  #  Base de datos — PostgreSQL. Aislada: sin puerto al host, sin Internet.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    container_name: zbx-postgres
+    <<: *hardening
+    networks: [back]
+    environment:
+      POSTGRES_USER: zabbix
+      POSTGRES_DB: zabbix
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      # Endurece la BD: exige contraseña cifrada (scram) también en conexiones locales
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zabbix -d zabbix -q"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    mem_limit: 1g
+    pids_limit: 200
+
+  # ---------------------------------------------------------------------------
+  #  Servidor Zabbix — motor de recolección, triggers y alertas.
+  #  Sin salida a Internet ni puerto publicado (los agentes le hablan por red).
+  # ---------------------------------------------------------------------------
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:${ZBX_IMAGE_TAG}
+    container_name: zbx-server
+    <<: *hardening
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [back, mon]
+    environment:
+      DB_SERVER_HOST: postgres
+      POSTGRES_USER: zabbix
+      POSTGRES_DB: zabbix
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      ZBX_STARTPINGERS: "2"
+      ZBX_CACHESIZE: "64M"
+      ZBX_HISTORYCACHESIZE: "32M"
+      ZBX_VALUECACHESIZE: "64M"
+      # Habilita el punto de estadísticas internas del propio servidor
+      ZBX_ENABLE_SNMP_TRAPS: "false"
+      ZBX_TIMEOUT: "10"
+    secrets: [postgres_password]
+    mem_limit: 1g
+    pids_limit: 400
+
+  # ---------------------------------------------------------------------------
+  #  Frontend web (nginx + PHP). Único servicio expuesto, y solo por HTTPS.
+  # ---------------------------------------------------------------------------
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:${ZBX_IMAGE_TAG}
+    container_name: zbx-web
+    <<: *hardening
+    depends_on:
+      postgres: { condition: service_healthy }
+      zabbix-server: { condition: service_started }
+    networks: [back, edge]
+    ports:
+      - "${ZBX_WEB_HTTPS_PORT}:8443"       # solo HTTPS al host
+    environment:
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_SERVER_NAME: ${ZBX_SERVER_NAME}
+      DB_SERVER_HOST: postgres
+      POSTGRES_USER: zabbix
+      POSTGRES_DB: zabbix
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      PHP_TZ: ${PHP_TZ}
+      # Cabeceras de seguridad y cookies endurecidas en el frontend
+      ZBX_SESSION_NAME: zbx_academia
+    secrets: [postgres_password]
+    volumes:
+      - ./tls/ssl.crt:/etc/ssl/nginx/ssl.crt:ro
+      - ./tls/ssl.key:/etc/ssl/nginx/ssl.key:ro
+      - ./tls/dhparam.pem:/etc/ssl/nginx/dhparam.pem:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    mem_limit: 512m
+    pids_limit: 200
+
+  # ---------------------------------------------------------------------------
+  #  psk-init — coloca cada clave PSK en un volumen propiedad del usuario
+  #  del agente (uid 1997) con permisos 0600. Corre una vez y termina.
+  # ---------------------------------------------------------------------------
+  psk-init:
+    image: busybox:1.36
+    container_name: zbx-psk-init
+    user: root
+    networks: [mon]
+    volumes:
+      - ./psk:/src:ro
+      - psk_web:/out/web
+      - psk_db:/out/db
+      - psk_app:/out/app
+      - psk_vuln:/out/vuln
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        cp /src/agent-web.psk /out/web/agent.psk
+        cp /src/agent-db.psk  /out/db/agent.psk
+        cp /src/agent-app.psk /out/app/agent.psk
+        cp /src/agent-web.psk /out/vuln/agent.psk
+        chown 1997:1997 /out/web/agent.psk /out/db/agent.psk /out/app/agent.psk /out/vuln/agent.psk
+        chmod 0600       /out/web/agent.psk /out/db/agent.psk /out/app/agent.psk /out/vuln/agent.psk
+        echo "psk-init: material PSK preparado (0600, uid 1997)"
+    restart: "no"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  #  Cliente 1 — "srv-web". Agente 2 endurecido, cifrado PSK.
+  #  system.run deshabilitado; solo se permiten claves de monitorización.
+  # ---------------------------------------------------------------------------
+  agent-web:
+    image: zabbix/zabbix-agent2:${ZBX_IMAGE_TAG}
+    container_name: zbx-agent-web
+    <<: *hardening
+    depends_on:
+      psk-init: { condition: service_completed_successfully }
+    networks:
+      mon: { aliases: [agent-web] }
+    environment:
+      ZBX_HOSTNAME: srv-web
+      ZBX_SERVER_HOST: zabbix-server          # fija Server= y ServerActive= al servidor del lab
+      ZBX_TLSCONNECT: psk
+      ZBX_TLSACCEPT: psk
+      ZBX_TLSPSKIDENTITY: ${PSK_IDENTITY_WEB}
+      ZBX_TLSPSKFILE: /var/lib/zabbix/enc/agent.psk
+      ZBX_DENYKEY: "system.run[*]"             # <-- clave del hardening del agente
+    volumes:
+      - psk_web:/var/lib/zabbix/enc:ro
+      - ./config/agent-web/lab.conf:/etc/zabbix/zabbix_agentd.d/zz-lab.conf:ro
+    mem_limit: 256m
+    pids_limit: 100
+
+  # ---------------------------------------------------------------------------
+  #  Cliente 2 — "srv-db". Mismo endurecimiento, otra PSK.
+  # ---------------------------------------------------------------------------
+  agent-db:
+    image: zabbix/zabbix-agent2:${ZBX_IMAGE_TAG}
+    container_name: zbx-agent-db
+    <<: *hardening
+    depends_on:
+      psk-init: { condition: service_completed_successfully }
+    networks:
+      mon: { aliases: [agent-db] }
+    environment:
+      ZBX_HOSTNAME: srv-db
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_TLSCONNECT: psk
+      ZBX_TLSACCEPT: psk
+      ZBX_TLSPSKIDENTITY: ${PSK_IDENTITY_DB}
+      ZBX_TLSPSKFILE: /var/lib/zabbix/enc/agent.psk
+      ZBX_DENYKEY: "system.run[*]"
+    volumes:
+      - psk_db:/var/lib/zabbix/enc:ro
+      - ./config/agent-db/lab.conf:/etc/zabbix/zabbix_agentd.d/zz-lab.conf:ro
+    mem_limit: 256m
+    pids_limit: 100
+
+  # ---------------------------------------------------------------------------
+  #  Provisioner — configura Zabbix vía API (idempotente) y termina.
+  #  Cambia la contraseña de Admin, crea el grupo, los 2 hosts con PSK,
+  #  vincula plantillas y crea el usuario de solo lectura para Grafana.
+  # ---------------------------------------------------------------------------
+  provisioner:
+    image: python:3.12-alpine
+    container_name: zbx-provisioner
+    depends_on:
+      zabbix-web: { condition: service_healthy }
+      zabbix-server: { condition: service_started }
+    networks: [back]
+    environment:
+      ZBX_API_URL: "http://zabbix-web:8080/api_jsonrpc.php"
+      PSK_IDENTITY_WEB: ${PSK_IDENTITY_WEB}
+      PSK_IDENTITY_DB: ${PSK_IDENTITY_DB}
+      PSK_IDENTITY_APP: ${PSK_IDENTITY_APP}
+      # PROVISION_APP lo activa 'make demo' para dar de alta el 3er cliente
+      PROVISION_APP: "${PROVISION_APP:-false}"
+    secrets:
+      - zabbix_admin_password
+      - zabbix_api_password
+    volumes:
+      - ./provisioner/provision.py:/provision.py:ro
+      - ./psk:/psk:ro
+    command: ["python3", "/provision.py"]
+    restart: "no"
+    logging: *default-logging
+
+  # ---------------------------------------------------------------------------
+  #  Grafana (perfil "grafana") — dashboards avanzados con el plugin Zabbix.
+  #  Único servicio con salida a Internet (para instalar el plugin).
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: ${GRAFANA_IMAGE}
+    container_name: zbx-grafana
+    <<: *hardening
+    profiles: [grafana]
+    depends_on:
+      provisioner: { condition: service_completed_successfully }
+    networks: [back, edge]
+    ports:
+      - "${GRAFANA_PORT}:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_INSTALL_PLUGINS: alexanderzobnin-zabbix-app
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_CONTENT_SECURITY_POLICY: "true"
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      # La contraseña del usuario 'grafana' de la API de Zabbix la lee el
+      # datasource directamente del secreto con $__file{} (ver zabbix.yml).
+    secrets:
+      - grafana_admin_password
+      - zabbix_api_password
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    mem_limit: 512m
+    pids_limit: 200
+
+  # ---------------------------------------------------------------------------
+  #  srv-app (perfil "demo") — TERCER cliente monitorizado, con carga real de
+  #  CPU para que las gráficas oscilen de forma visible en clase. Agente PSK.
+  #  Se da de alta con:  make demo  (arranca el contenedor y re-provisiona).
+  # ---------------------------------------------------------------------------
+  srv-app:
+    image: zabbix/zabbix-agent2:${ZBX_IMAGE_TAG}
+    container_name: zbx-agent-app
+    <<: *hardening
+    profiles: [demo]
+    depends_on:
+      psk-init: { condition: service_completed_successfully }
+    networks:
+      mon: { aliases: [srv-app] }
+    environment:
+      ZBX_HOSTNAME: srv-app
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_TLSCONNECT: psk
+      ZBX_TLSACCEPT: psk
+      ZBX_TLSPSKIDENTITY: ${PSK_IDENTITY_APP}
+      ZBX_TLSPSKFILE: /var/lib/zabbix/enc/agent.psk
+      ZBX_DENYKEY: "system.run[*]"
+    volumes:
+      - psk_app:/var/lib/zabbix/enc:ro
+    # Carga de CPU con ciclo de trabajo (3s activo / 3s reposo) -> gráfica en
+    # diente de sierra, y luego arranca el agente con su config intacta.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        ( while :; do end=$$((SECONDS+3)); while [ $$SECONDS -lt $$end ]; do :; done; sleep 3; done ) &
+        exec /usr/bin/docker-entrypoint.sh /usr/sbin/zabbix_agent2 --foreground -c /etc/zabbix/zabbix_agent2.conf
+    mem_limit: 256m
+    pids_limit: 100
+
+  # ---------------------------------------------------------------------------
+  #  agent-vuln (perfil "vuln") — AGENTE DELIBERADAMENTE INSEGURO.
+  #  Solo para el módulo ofensivo (docs/04-superficie-ataque.md).
+  #  system.run HABILITADO y sin cifrado: se explota y luego se remedia.
+  #  Vive en su propia red aislada 'vuln' para no contaminar el resto.
+  # ---------------------------------------------------------------------------
+  agent-vuln:
+    image: zabbix/zabbix-agent2:${ZBX_IMAGE_TAG}
+    container_name: zbx-agent-vuln
+    profiles: [vuln]
+    security_opt: [no-new-privileges:true]
+    cap_drop: [NET_RAW]
+    depends_on:
+      psk-init: { condition: service_completed_successfully }
+    networks:
+      vuln: { aliases: [agent-vuln] }
+    ports:
+      - "127.0.0.1:10050:10050"     # expuesto SOLO a localhost para el ejercicio
+    environment:
+      ZBX_HOSTNAME: srv-vuln
+      ZBX_SERVER_HOST: "0.0.0.0/0"          # inseguro a propósito: acepta a cualquiera
+      ZBX_ACTIVE_ALLOW: "false"             # solo pasivo (se ataca con zabbix_get)
+      # SIN cifrado (unencrypted) y con ejecución remota de comandos habilitada
+      ZBX_ALLOWKEY: "system.run[*]"         # <-- la mala práctica que se demuestra
+      ZBX_UNSAFEUSERPARAMETERS: "1"         # permite metacaracteres en UserParameters
+    volumes:
+      - ./config/agent-vuln/lab.conf:/etc/zabbix/zabbix_agentd.d/zz-lab.conf:ro
+    mem_limit: 256m
+    pids_limit: 100
+    logging: *default-logging
+
+# =============================================================================
+#  Redes — segmentación por función. 'back' y 'mon' sin salida a Internet.
+# =============================================================================
+networks:
+  edge:              # publicación al host + salida a Internet (solo web/grafana)
+    driver: bridge
+  back:              # BD, servidor, frontend, provisioner. Aislada de Internet.
+    driver: bridge
+    internal: true
+  mon:               # tráfico servidor<->agentes. Aislada de Internet.
+    driver: bridge
+    internal: true
+  vuln:              # red del laboratorio ofensivo, separada de back/mon.
+    driver: bridge   # NO internal: Docker solo publica puertos en redes con
+                     # gateway. El agente se publica solo en 127.0.0.1 y no
+                     # tiene ruta hacia el servidor/BD reales (redes distintas).
+
+# =============================================================================
+#  Volúmenes
+# =============================================================================
+volumes:
+  pgdata:
+  grafana_data:
+  psk_web:
+  psk_db:
+  psk_app:
+  psk_vuln:
+
+# =============================================================================
+#  Secrets — leídos de ficheros locales (generados por scripts/bootstrap.sh)
+# =============================================================================
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  zabbix_admin_password:
+    file: ./secrets/zabbix_admin_password.txt
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password.txt
+  zabbix_api_password:
+    file: ./secrets/zabbix_api_password.txt

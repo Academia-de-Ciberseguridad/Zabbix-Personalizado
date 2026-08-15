@@ -1,0 +1,23 @@
+# Datasource Zabbix provisionado automáticamente.
+# Se autentica como el usuario 'grafana' (solo lectura) que crea el provisioner.
+# La contraseña se lee del secreto en tiempo de arranque con $__file{}.
+apiVersion: 1
+
+datasources:
+  - name: Zabbix
+    uid: zabbix-academia
+    type: alexanderzobnin-zabbix-datasource
+    access: proxy
+    url: http://zabbix-web:8080/api_jsonrpc.php
+    isDefault: true
+    editable: false
+    jsonData:
+      username: grafana
+      trends: false            # el lab tiene datos recientes: usar historia directa
+      trendsFrom: "7d"
+      trendsRange: "4d"
+      cacheTTL: "1h"
+      timeout: 30
+      disableReadOnlyUsersAck: true
+    secureJsonData:
+      password: $__file{/run/secrets/zabbix_api_password}
